@@ -34,6 +34,10 @@ cl /nologo /std:c++17 /EHsc /W4 /O2 pdbstrip.cpp /Fe:pdbstrip.exe
 pdbstrip.exe private.pdb private-no-source.pdb
 ```
 
+During processing, the tool reports each stripping stage, record and stream
+counts, explicit no-op decisions when optional source data is absent, and the
+final size change.
+
 The tool intentionally supports modern MSF 7.00 PDBs only. Use a full PDB
 (`/DEBUG:FULL`), not a partial `/DEBUG:FASTLINK` PDB.
 
