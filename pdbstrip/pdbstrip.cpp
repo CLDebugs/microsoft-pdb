@@ -490,7 +490,13 @@ std::vector<std::size_t> moduleRecords(const Bytes& modules) {
     return result;
 }
 
-std::set<std::string> rewriteDbi(Msf& msf) {
+struct DbiResult {
+    std::set<std::string> sourceNames;
+    std::size_t modules = 0;
+    std::size_t moduleStreams = 0;
+};
+
+DbiResult rewriteDbi(Msf& msf) {
     Bytes dbi = msf.readStream(kDbiStream);
     if (dbi.size() < kDbiHeaderSize || read32(dbi, 0) != 0xffffffffu)
         throw Error("unsupported DBI stream");
@@ -512,6 +518,8 @@ std::set<std::string> rewriteDbi(Msf& msf) {
 
     Bytes modules(dbi.begin() + kDbiHeaderSize, dbi.begin() + modulesEnd);
     const auto records = moduleRecords(modules);
+    DbiResult result;
+    result.modules = records.size();
     for (auto offset : records) {
         const auto moduleEnd = cstringEnd(modules, offset + kModiFixedSize, modules.size());
         const auto objectEnd = cstringEnd(modules, moduleEnd, modules.size());
@@ -527,6 +535,7 @@ std::set<std::string> rewriteDbi(Msf& msf) {
         write32(modules, offset + 56, 0);
         write16(modules, offset + 32, read16(modules, offset + 32) & ~std::uint16_t(2));
         if (streamNumber == 0xffff) continue;
+        ++result.moduleStreams;
         Bytes stream = msf.readStream(streamNumber);
         const auto c13Start = static_cast<std::size_t>(symbolsSize) + oldLinesSize;
         const auto c13End = c13Start + c13Size;
@@ -545,7 +554,6 @@ std::set<std::string> rewriteDbi(Msf& msf) {
 
     Bytes header(dbi.begin(), dbi.begin() + kDbiHeaderSize);
     Bytes fileInfo(dbi.begin() + secMapEnd, dbi.begin() + filesEnd);
-    std::set<std::string> sourceNames;
     if (!fileInfo.empty()) {
         if (fileInfo.size() < 4 + records.size() * 4)
             throw Error("truncated DBI file-info substream");
@@ -566,8 +574,9 @@ std::set<std::string> rewriteDbi(Msf& msf) {
         for (std::size_t cursor = namesStart; cursor < fileInfo.size();) {
             const auto end = cstringEnd(fileInfo, cursor, fileInfo.size());
             if (end > cursor + 1)
-                sourceNames.emplace(reinterpret_cast<const char*>(fileInfo.data() + cursor),
-                                    end - cursor - 1);
+                result.sourceNames.emplace(
+                    reinterpret_cast<const char*>(fileInfo.data() + cursor),
+                    end - cursor - 1);
             cursor = end;
         }
         std::fill(fileInfo.begin(), fileInfo.end(), Byte{0});
@@ -591,7 +600,7 @@ std::set<std::string> rewriteDbi(Msf& msf) {
     rewritten.insert(rewritten.end(), ecInfo.begin(), ecInfo.end());
     rewritten.insert(rewritten.end(), dbi.begin() + ecEnd, dbi.end());
     msf.writeStream(kDbiStream, rewritten);
-    return sourceNames;
+    return result;
 }
 
 struct TypeRecord {
@@ -610,10 +619,17 @@ std::uint32_t pdbCrc32(const Byte* bytes, std::size_t size) {
     return crc;
 }
 
-void sanitizeIpi(Msf& msf) {
+struct IpiResult {
+    std::size_t buildInfoRecords = 0;
+    std::size_t udtSourceLineRecords = 0;
+    std::size_t stringIdsRedacted = 0;
+};
+
+IpiResult sanitizeIpi(Msf& msf) {
     constexpr std::uint32_t ipiStream = 4;
     Bytes ipi = msf.readStream(ipiStream);
-    if (ipi.empty()) return;
+    IpiResult result;
+    if (ipi.empty()) return result;
     if (ipi.size() < 20) throw Error("truncated IPI stream");
     const auto headerSize = read32(ipi, 4);
     const auto idMin = read32(ipi, 8);
@@ -638,6 +654,7 @@ void sanitizeIpi(Msf& msf) {
     for (const auto& [id, record] : records) {
         (void)id;
         if (record.leaf == kLfBuildInfo) {
+            ++result.buildInfoRecords;
             if (record.size < 6) throw Error("truncated LF_BUILDINFO");
             const auto count = read16(ipi, record.offset + 4);
             if (6 + static_cast<std::size_t>(count) * 4 > record.size)
@@ -645,6 +662,7 @@ void sanitizeIpi(Msf& msf) {
             for (std::uint16_t argument = 0; argument != count; ++argument)
                 redactIds.insert(read32(ipi, record.offset + 6 + argument * 4));
         } else if (record.leaf == kLfUdtSrcLine || record.leaf == kLfUdtModSrcLine) {
+            ++result.udtSourceLineRecords;
             if (record.size < 16) throw Error("truncated UDT source-line record");
             redactIds.insert(read32(ipi, record.offset + 8));
             write32(ipi, record.offset + 12, 0);
@@ -697,7 +715,9 @@ void sanitizeIpi(Msf& msf) {
         }
         msf.writeStream(hashStreamNumber, hashes);
     }
+    result.stringIdsRedacted = modifiedStringIds.size();
     msf.writeStream(ipiStream, ipi);
+    return result;
 }
 
 std::uint32_t nameHashV1(const Byte* bytes, std::size_t size) {
@@ -752,9 +772,9 @@ std::string redactedName(std::size_t size, std::uint32_t ordinal) {
     return value;
 }
 
-void redactGlobalNames(Msf& msf, std::uint32_t streamNumber,
-                       const std::set<std::string>& sourceNames) {
-    if (streamNumber == kNilSize || sourceNames.empty()) return;
+std::size_t redactGlobalNames(Msf& msf, std::uint32_t streamNumber,
+                              const std::set<std::string>& sourceNames) {
+    if (streamNumber == kNilSize || sourceNames.empty()) return 0;
     Bytes names = msf.readStream(streamNumber);
     if (names.size() < 16 || read32(names, 0) != 0xeffeeffe)
         throw Error("unsupported /names stream");
@@ -772,6 +792,7 @@ void redactGlobalNames(Msf& msf, std::uint32_t streamNumber,
 
     std::vector<std::uint32_t> nameOffsets;
     std::uint32_t ordinal = 1;
+    std::size_t redacted = 0;
     for (std::size_t cursor = stringsStart; cursor < stringsEnd;) {
         const auto end = cstringEnd(names, cursor, stringsEnd);
         const auto length = end - cursor - 1;
@@ -782,6 +803,7 @@ void redactGlobalNames(Msf& msf, std::uint32_t streamNumber,
             if (sourceNames.count(name) != 0) {
                 const auto replacement = redactedName(length, ordinal++);
                 std::copy(replacement.begin(), replacement.end(), names.begin() + cursor);
+                ++redacted;
             }
         }
         cursor = end;
@@ -803,6 +825,7 @@ void redactGlobalNames(Msf& msf, std::uint32_t streamNumber,
     write32(names, hashesStart + static_cast<std::size_t>(hashCount) * 4,
             static_cast<std::uint32_t>(nameOffsets.size()));
     msf.writeStream(streamNumber, names);
+    return redacted;
 }
 
 bool sourceStreamName(std::string name) {
@@ -881,6 +904,10 @@ void strip(const std::filesystem::path& input, const std::filesystem::path& outp
         std::filesystem::absolute(output).lexically_normal())
         throw Error("input and output must differ");
     if (std::filesystem::exists(output)) throw Error("output file already exists");
+    const auto inputSize = std::filesystem::file_size(input);
+    std::wcout << L"Input:  " << input << L" (" << inputSize << L" bytes)\n";
+    std::wcout << L"Output: " << output << L"\n";
+    std::wcout << L"Copying input to a temporary working file...\n";
     TemporaryFile temporary(output);
     TemporaryFile compact(output);
     std::filesystem::copy_file(input, temporary.path(),
@@ -891,16 +918,49 @@ void strip(const std::filesystem::path& input, const std::filesystem::path& outp
         throw Error("cannot make temporary output writable");
     {
         Msf msf(temporary.path());
-        const auto sourceNames = rewriteDbi(msf);
-        sanitizeIpi(msf);
+        std::wcout << L"DBI: removing line tables, source metadata, and path-bearing module data...\n";
+        const auto dbi = rewriteDbi(msf);
+        std::wcout << L"DBI: processed " << dbi.modules << L" module record(s), including "
+                   << dbi.moduleStreams << L" module stream(s); found "
+                   << dbi.sourceNames.size() << L" unique source filename(s).\n";
+
+        std::wcout << L"IPI: sanitizing build arguments and UDT source-line records...\n";
+        const auto ipi = sanitizeIpi(msf);
+        std::wcout << L"IPI: processed " << ipi.buildInfoRecords << L" build-info record(s) and "
+                   << ipi.udtSourceLineRecords << L" UDT source-line record(s); redacted "
+                   << ipi.stringIdsRedacted << L" string ID(s).\n";
+
         std::set<std::uint32_t> removedStreams;
         const auto namesStream = rewriteNamedStreams(msf, removedStreams);
-        redactGlobalNames(msf, namesStream, sourceNames);
+        if (removedStreams.empty())
+            std::wcout << L"Named streams: no source-bearing streams found; nothing to clear.\n";
+        else
+            std::wcout << L"Named streams: clearing " << removedStreams.size()
+                       << L" source-bearing stream(s).\n";
+
+        if (namesStream == kNilSize)
+            std::wcout << L"/names: stream not present; skipping global source-name redaction.\n";
+        else if (dbi.sourceNames.empty())
+            std::wcout << L"/names: no DBI source filenames found; nothing to redact.\n";
+        const auto redactedNames = redactGlobalNames(msf, namesStream, dbi.sourceNames);
+        if (namesStream != kNilSize && !dbi.sourceNames.empty())
+            std::wcout << L"/names: redacted " << redactedNames
+                       << L" matching source filename entr"
+                       << (redactedNames == 1 ? L"y.\n" : L"ies.\n");
+
         for (auto stream : removedStreams) msf.clearStream(stream);
+        std::wcout << L"Writing compact MSF output...\n";
         msf.writeCompact(compact.path());
     }
     std::filesystem::rename(compact.path(), output);
     compact.release();
+    const auto outputSize = std::filesystem::file_size(output);
+    std::wcout << L"Completed: " << outputSize << L" bytes";
+    if (outputSize <= inputSize)
+        std::wcout << L" (" << inputSize - outputSize << L" bytes smaller)";
+    else
+        std::wcout << L" (" << outputSize - inputSize << L" bytes larger)";
+    std::wcout << L".\n";
 }
 
 } // namespace
